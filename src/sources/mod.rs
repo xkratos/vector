@@ -88,6 +88,8 @@ pub mod statsd;
 pub mod syslog;
 #[cfg(feature = "sources-vector")]
 pub mod vector;
+#[cfg(feature = "sources-xis_puller")]
+pub mod xis_puller;
 
 pub mod util;
 

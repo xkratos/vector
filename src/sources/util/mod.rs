@@ -2,6 +2,8 @@
 #[cfg(feature = "sources-http_server")]
 mod body_decoding;
 mod encoding_config;
+#[cfg(feature = "sources-xis_puller")]
+pub mod xis_puller;
 #[cfg(all(unix, feature = "sources-dnstap"))]
 pub mod framestream;
 #[cfg(any(feature = "sources-vector", feature = "sources-opentelemetry"))]
@@ -32,6 +34,7 @@ mod unix_datagram;
 #[cfg(all(unix, feature = "sources-utils-net-unix"))]
 mod unix_stream;
 mod wrappers;
+
 
 #[cfg(feature = "sources-file")]
 pub use encoding_config::EncodingConfig;
@@ -67,6 +70,7 @@ pub use self::http::HttpSource;
 pub use self::http::HttpSourceAuthConfig;
 #[cfg(any(feature = "sources-aws_sqs", feature = "sources-gcp_pubsub"))]
 pub use self::message_decoding::decode_message;
+
 
 /// Extract a tag and it's value from input string delimited by a colon character.
 ///

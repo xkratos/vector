@@ -568,6 +568,7 @@ sources-logs = [
   "sources-stdin",
   "sources-syslog",
   "sources-vector",
+  "sources-xis_puller",
 ]
 sources-metrics = [
   "dep:prost",
@@ -641,6 +642,7 @@ sources-utils-net-tcp = ["listenfd", "dep:ipnet"]
 sources-utils-net-udp = ["listenfd"]
 sources-utils-net-unix = []
 
+sources-xis_puller = ["sources-utils-http", "sources-http_server"]
 sources-vector = ["dep:prost", "dep:tonic", "protobuf-build"]
 
 # Transforms
