@@ -8,15 +8,6 @@
 //!   - Call call() supplying the generic inputs for calling and the source-specific
 //!     context.
 
-use bytes::Bytes;
-use futures_util::{stream, FutureExt, StreamExt, TryFutureExt};
-use http::{response::Parts, Uri};
-use hyper::{Body, Request};
-use std::time::Duration;
-use std::{collections::HashMap, future::ready};
-use tokio_stream;
-use vector_lib::json_size::JsonSize;
-use chrono::{DateTime, Utc};
 use self::super::vrl::VrlDeserializerConfig;
 use crate::{
     http::{Auth, HttpClient},
@@ -28,8 +19,20 @@ use crate::{
     tls::TlsSettings,
     SourceSender,
 };
+use futures::TryFutureExt;
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use http::{response::Parts, Uri};
+use hyper::{Body, Request};
+use std::collections::HashMap;
+use std::time::Duration;
+use vector_lib::json_size::JsonSize;
 use vector_lib::shutdown::ShutdownSignal;
-use vector_lib::{config::proxy::ProxyConfig, event::Event, EstimatedJsonEncodedSizeOf};
+use vector_lib::{
+    config::proxy::ProxyConfig,
+    event::{BatchNotifier, BatchStatus, BatchStatusReceiver, Event},
+    EstimatedJsonEncodedSizeOf,
+};
 
 /// Contains the inputs generic to any http client.
 pub(crate) struct GenericPullerClientInputs {
@@ -137,7 +140,6 @@ pub(crate) fn skip_if_timestamp_is_future(timestamp: DateTime<Utc>) -> bool {
     timestamp > now
 }
 
-
 /// Calls one or more urls at an interval.
 ///   - The HTTP request is built per the options in provided generic inputs.
 ///   - The HTTP response is decoded/parsed into events by the specific context.
@@ -151,144 +153,150 @@ pub(crate) async fn call<
     mut out: SourceSender,
     http_method: HttpMethod,
 ) -> Result<(), ()> {
-    // TODO: change this once we have a way to check if the timestamp is in the future
     if skip_if_timestamp_is_future(Utc::now()) {
         println!("skipping");
         return Ok(());
     }
+
     let time_range = inputs.time_range;
     println!("time_range: {:?}", time_range);
-    // Building the HttpClient should not fail as it is just setting up the client with the
-    // proxy and tls settings.
+
     let client =
         HttpClient::new(inputs.tls.clone(), &inputs.proxy).expect("Building HTTP client failed");
-    let mut stream = tokio_stream::iter(inputs.urls.clone())
-        .take_until(inputs.shutdown)
-        .map(move |_| stream::iter(inputs.urls.clone()))
-        .flatten()
-        .map(move |url| {
-            let client = client.clone();
-            let endpoint = url.to_string();
-            let cursor_vrl = inputs.cursor_vrl.build();
-            let context_builder = context_builder.clone();
-            let mut context = context_builder.build(&url);
 
-            let mut builder = match http_method {
-                HttpMethod::Head => Request::head(&url),
-                HttpMethod::Get => Request::get(&url),
-                HttpMethod::Post => Request::post(&url),
-                HttpMethod::Put => Request::put(&url),
-                HttpMethod::Patch => Request::patch(&url),
-                HttpMethod::Delete => Request::delete(&url),
-                HttpMethod::Options => Request::options(&url),
-            };
+    loop {
+        tokio::select! {
+            _ = inputs.shutdown.clone() => break,
 
-            // add user specified headers
-            for (header, values) in &inputs.headers {
-                for value in values {
-                    builder = builder.header(header, value);
-                }
-            }
+            _ = async {} => {
+                for url in &inputs.urls {
+                    let url_vrl = inputs.url_vrl.build();
+                    println!("url_vrl: {:?}", url_vrl);
+                    let endpoint = url.to_string();
+                    let cursor_vrl = inputs.cursor_vrl.build();
+                    let mut context = context_builder.clone().build(url);
 
-            // set ACCEPT header if not user specified
-            if !inputs.headers.contains_key(http::header::ACCEPT.as_str()) {
-                builder = builder.header(http::header::ACCEPT, &inputs.content_type);
-            }
+                    let mut builder = match http_method {
+                        HttpMethod::Head => Request::head(url),
+                        HttpMethod::Get => Request::get(url),
+                        HttpMethod::Post => Request::post(url),
+                        HttpMethod::Put => Request::put(url),
+                        HttpMethod::Patch => Request::patch(url),
+                        HttpMethod::Delete => Request::delete(url),
+                        HttpMethod::Options => Request::options(url),
+                    };
 
-            // building an empty request should be infallible
-            let mut request = builder.body(Body::empty()).expect("error creating request");
-
-            if let Some(auth) = &inputs.auth {
-                auth.apply(&mut request);
-            }
-
-            tokio::time::timeout(inputs.timeout, client.send(request))
-                .then(move |result| async move {
-                    match result {
-                        Ok(Ok(response)) => Ok(response),
-                        Ok(Err(error)) => Err(error.into()),
-                        Err(_) => Err(format!(
-                            "Timeout error: request exceeded {}s",
-                            inputs.timeout.as_secs_f64()
-                        )
-                        .into()),
+                    // Add headers
+                    for (header, values) in &inputs.headers {
+                        for value in values {
+                            builder = builder.header(header, value);
+                        }
                     }
-                })
-                .and_then(|response| async move {
+
+                    if !inputs.headers.contains_key(http::header::ACCEPT.as_str()) {
+                        builder = builder.header(http::header::ACCEPT, &inputs.content_type);
+                    }
+
+                    let mut request = builder.body(Body::empty()).expect("error creating request");
+
+                    if let Some(auth) = &inputs.auth {
+                        auth.apply(&mut request);
+                    }
+
+                    // Make the request with timeout
+                    let response = match tokio::time::timeout(inputs.timeout, client.send(request)).await {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(error)) => {
+                            emit!(HttpClientHttpError {
+                                error: Box::new(error),
+                                url: url.to_string()
+                            });
+                            continue;
+                        }
+                        Err(_) => {
+                            emit!(HttpClientHttpError {
+                                error: format!("Timeout error: request exceeded {}s", inputs.timeout.as_secs_f64()).into(),
+                                url: url.to_string()
+                            });
+                            continue;
+                        }
+                    };
+
+                    // Process response
                     let (header, body) = response.into_parts();
-                    let body = hyper::body::to_bytes(body).await?;
+                    let body = match hyper::body::to_bytes(body).await {
+                        Ok(body) => body,
+                        Err(e) => {
+                            emit!(HttpClientHttpError {
+                                error: e.into(),
+                                url: url.to_string()
+                            });
+                            continue;
+                        }
+                    };
+
                     emit!(EndpointBytesReceived {
                         byte_size: body.len(),
                         protocol: "http",
                         endpoint: endpoint.as_str(),
                     });
-                    Ok((header, body))
-                })
-                .into_stream()
-                .filter_map(move |response| {
-                    ready(match response {
-                        Ok((header, body)) if header.status == hyper::StatusCode::OK => {
-                            let _cursor_map = cursor_vrl.as_ref().unwrap().parse_cursor(body.clone());
-                            println!("cursor_map: {:?}", _cursor_map);
-                            context.on_response(&url, &header, &body).map(|mut events| {
-                                let byte_size = if events.is_empty() {
-                                    // We need to explicitly set the byte size
-                                    // to 0 since
-                                    // `estimated_json_encoded_size_of` returns
-                                    // at least 1 for an empty collection. For
-                                    // the purposes of the
-                                    // HttpClientEventsReceived event, we should
-                                    // emit 0 when there aren't any usable
-                                    // metrics.
-                                    JsonSize::zero()
-                                } else {
-                                    events.estimated_json_encoded_size_of()
-                                };
 
-                                emit!(HttpClientEventsReceived {
-                                    byte_size,
-                                    count: events.len(),
-                                    url: url.to_string()
-                                });
-                                // We'll enrich after receiving the events so
-                                // that the byte sizes are accurate.
-                                context.enrich_events(&mut events);
+                    if header.status == hyper::StatusCode::OK {
+                        let _cursor_map = cursor_vrl.as_ref().unwrap().parse_cursor(body.clone());
+                        println!("cursor_map: {:?}", _cursor_map);
 
-                                stream::iter(events)
-                            })
-                        }
-                        Ok((header, _)) => {
-                            context.on_http_response_error(&url, &header);
-                            emit!(HttpClientHttpResponseError {
-                                code: header.status,
-                                url: url.to_string(),
-                            });
-                            None
-                        }
-                        Err(error) => {
-                            emit!(HttpClientHttpError {
-                                error,
+                        if let Some(mut events) = context.on_response(url, &header, &body) {
+                            let byte_size = if events.is_empty() {
+                                JsonSize::zero()
+                            } else {
+                                events.estimated_json_encoded_size_of()
+                            };
+
+                            emit!(HttpClientEventsReceived {
+                                byte_size,
+                                count: events.len(),
                                 url: url.to_string()
                             });
-                            None
-                        }
-                    })
-                })
-                .flatten()
-                .boxed()
-        })
-        .flatten_unordered(None)
-        .boxed();
 
-    match out.send_event_stream(&mut stream).await {
-        Ok(()) => {
-            debug!("Finished sending.");
-            Ok(())
+                            context.enrich_events(&mut events);
+
+                            let receiver = BatchNotifier::maybe_apply_to(true, &mut events);
+                            let count = events.len();
+                            let _ = out.send_batch(events)
+                                .map_err(|_| {
+                                    // can only fail if receiving end disconnected, so we are shutting down,
+                                    // probably not gracefully.
+                                    emit!(StreamClosedError { count });
+                                })
+                                .and_then(|_| handle_batch_status(receiver))
+                                .await;
+                        }
+                    } else {
+                        context.on_http_response_error(url, &header);
+                        emit!(HttpClientHttpResponseError {
+                            code: header.status,
+                            url: url.to_string(),
+                        });
+                    }
+                }
+                // Wait for the configured interval before starting the next iteration
+                tokio::time::sleep(inputs.interval).await;
+            }
         }
-        Err(_) => {
-            let (count, _) = stream.size_hint();
-            emit!(StreamClosedError { count });
-            Err(())
-        }
+    }
+
+    Ok(())
+}
+
+async fn handle_batch_status(
+    receiver: Option<BatchStatusReceiver>,
+) -> Result<(), ()> {
+    match receiver {
+        None => Ok(()),
+        Some(receiver) => match receiver.await {
+            BatchStatus::Delivered => Ok(()),
+            BatchStatus::Errored => Err(()),
+            BatchStatus::Rejected => Err(()),
+        },
     }
 }

@@ -52,6 +52,10 @@ pub struct PullerConfig {
     #[configurable(metadata(docs::examples = "http://127.0.0.1:9898/logs"))]
     pub endpoint: String,
 
+    /// The VRL program to parse the url.
+    #[configurable(derived)]
+    pub url_vrl: VrlDeserializerOptions,
+
     /// The VRL program to parse the cursor.
     #[configurable(derived)]
     pub cursor_vrl: VrlDeserializerOptions,
@@ -166,6 +170,10 @@ impl Default for PullerConfig {
         Self {
             endpoint: "http://localhost:9898/logs".to_string(),
             query: HashMap::new(),
+            url_vrl: VrlDeserializerOptions {
+                source: ".url = http://localhost:9898/logs".to_string(),
+                timezone: None,
+            },
             cursor_vrl: VrlDeserializerOptions {
                 source: ".cursor = .".to_string(),
                 timezone: None,
@@ -217,6 +225,9 @@ impl SourceConfig for PullerConfig {
 
         let inputs = GenericPullerClientInputs {
             urls,
+            url_vrl: VrlDeserializerConfig {
+                vrl: self.url_vrl.clone(),
+            },
             cursor_vrl: VrlDeserializerConfig {
                 vrl: self.cursor_vrl.clone(),
             },
